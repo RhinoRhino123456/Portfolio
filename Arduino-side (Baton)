@@ -1,0 +1,156 @@
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <MPU6050_light.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <OneButton.h>
+
+// ================= Hardware pin definitions =================
+#define RST_PIN 27
+#define SS_PIN 5
+#define BUTTON_PIN 25
+
+// ================= Global object =================
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+MPU6050 mpu(Wire); 
+OneButton button(BUTTON_PIN, true); 
+WebSocketsClient webSocket;
+
+// ================= Network configuration =================
+const char* ssid = "iPhone";                 
+const char* password = "Rhino033!";          
+const char* server_ip = "172.20.10.4";       
+const int server_port = 8765;                
+
+// ================= State variables =================
+bool isControllingVolume = false;
+
+//  Beat detection related variables
+unsigned long lastBeatTime = 0;
+const int beatCooldown = 300;     // Trigger cooldown time (milliseconds) to avoid multiple triggers from a single swing.
+const float gyroThreshold = 250.0; // Swing angular velocity threshold
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+
+  webSocket.begin(server_ip, server_port, "/");
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+
+  SPI.begin(18, 19, 23, 5); 
+  mfrc522.PCD_Init();
+
+  Wire.begin(21, 22);
+  byte status = mpu.begin();
+  Serial.print(F("MPU6050 status: "));
+  Serial.println(status);
+  while(status!=0){ } 
+  
+  Serial.println(F("Calibrating MPU6050，Please place the baton still on the table and do not move it..."));
+  delay(1000);
+  mpu.calcOffsets(); 
+  Serial.println(F("Calibration complete!"));
+
+  button.attachLongPressStart(onButtonPress);   
+  button.attachLongPressStop(onButtonRelease);  
+  button.attachDoubleClick(onButtonDoubleClick);
+}
+
+void loop() {
+  webSocket.loop();
+  button.tick(); 
+  mpu.update();  
+
+  checkNFC();
+
+  if (isControllingVolume) {
+    // Mode A: Adjust volume while holding the button.
+    handleMotionControl();
+  } else {
+    // Mode B: When the button is not pressed, detect rapid swings to keep the beat.
+    handleBeatDetection();
+  }
+}
+
+// ================= Function =================
+
+void checkNFC() {
+  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
+    return;
+  }
+  String uidString = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    uidString += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+    uidString += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  uidString.toUpperCase();
+  
+  sendJsonMessage("nfc_tap", "uid", uidString);
+  mfrc522.PICC_HaltA(); 
+}
+
+void onButtonPress() {
+  isControllingVolume = true;
+  sendJsonMessage("control_start", "status", "pressed");
+}
+
+void onButtonRelease() {
+  isControllingVolume = false;
+  sendJsonMessage("control_stop", "status", "released");
+}
+
+void onButtonDoubleClick() {
+  sendJsonMessage("clear_selection", "status", "double_clicked");
+}
+
+void handleMotionControl() {
+  float currentAngle = mpu.getAngleY(); 
+  
+  static unsigned long lastSendTime = 0;
+  if (millis() - lastSendTime > 50) {
+    sendJsonMessage("volume_change", "angle", String(currentAngle));
+    lastSendTime = millis();
+  }
+}
+
+// Handle beat detection
+void handleBeatDetection() {
+  // Get the angular velocity of the Z-axis
+  float gyroZ = abs(mpu.getGyroZ());
+  
+  if (gyroZ > gyroThreshold && (millis() - lastBeatTime > beatCooldown)) {
+    lastBeatTime = millis();
+    sendJsonMessage("beat_trigger", "status", "triggered");
+    Serial.println("Beat Triggered! GyroZ: " + String(gyroZ));
+  }
+}
+
+void sendJsonMessage(String action, String key, String value) {
+  StaticJsonDocument<200> doc;
+  doc["action"] = action;
+  doc[key] = value;
+  
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("WebSocket Disconnected");
+      break;
+    case WStype_CONNECTED:
+      Serial.println("WebSocket Connected");
+      break;
+  }
+}
