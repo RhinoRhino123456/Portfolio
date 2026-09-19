@@ -1,2 +1,2 @@
-# Portfolio
-For personal design portfolio
+# Portfolio-BandLet
+For personal design portfolio-The BandLet Project
