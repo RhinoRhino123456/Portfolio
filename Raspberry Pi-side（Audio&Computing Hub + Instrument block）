@@ -1,0 +1,233 @@
+import asyncio
+import websockets
+import json
+import pygame
+import os
+import sys
+import board
+import neopixel
+
+required_files = ["Guitar.wav", "Vocal.wav", "Drums.wav"]
+missing_files = [f for f in required_files if not os.path.exists(f)]
+
+if missing_files:
+    print(f"can't find the file: {', '.join(missing_files)}")
+    sys.exit(1)
+
+pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
+pygame.mixer.set_num_channels(8)
+
+tracks = {
+    "guitar": {"sound": pygame.mixer.Sound("Guitar.wav"), "channel": pygame.mixer.Channel(0)},
+    "vocal": {"sound": pygame.mixer.Sound("Vocal.wav"), "channel": pygame.mixer.Channel(1)},
+    "drum": {"sound": pygame.mixer.Sound("Drums.wav"), "channel": pygame.mixer.Channel(2)}
+}
+
+for name, track in tracks.items():
+    track["channel"].play(track["sound"], loops=-1)
+    track["channel"].set_volume(0.5)
+    track["channel"].pause()
+print("all music stems are loaded")
+
+NUM_PIXELS = 192
+pixels = neopixel.NeoPixel(board.D10, NUM_PIXELS, brightness=0.1, auto_write=False, pixel_order=neopixel.GRB)
+
+PATTERNS = {
+    "guitar": [
+        0, 0, 0, 0, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 0, 1, 0,
+        0, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 1, 0, 0, 0,
+        0, 1, 1, 1, 0, 0, 0, 0,
+        1, 1, 1, 1, 0, 0, 0, 0,
+        1, 1, 1, 0, 0, 0, 0, 0,
+        0, 1, 0, 0, 0, 0, 0, 0
+    ],
+    "vocal": [
+        0, 0, 0, 1, 1, 0, 0, 0,
+        0, 0, 1, 1, 1, 1, 0, 0,
+        0, 0, 1, 1, 1, 1, 0, 0,
+        0, 0, 0, 1, 1, 0, 0, 0,
+        0, 0, 0, 1, 1, 0, 0, 0,
+        0, 0, 1, 1, 1, 1, 0, 0,
+        0, 0, 0, 1, 1, 0, 0, 0,
+        0, 0, 0, 1, 1, 0, 0, 0
+    ],
+    "drum": [
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 1, 1, 0, 0, 1, 1, 0,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 1, 1, 0, 0, 1, 1, 0,
+        0, 1, 1, 0, 0, 1, 1, 0,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 0, 0, 0, 0, 0, 0, 0
+    ]
+}
+
+app_assigned_mapping = {
+    "1DDD24981C1080": {"instrument": "guitar", "block_index": 0, "is_bound": False},
+    "1DDB24981C1080": {"instrument": "vocal", "block_index": 1, "is_bound": False},
+    "1DDC24981C1080": {"instrument": "drum", "block_index": 2, "is_bound": False}
+}
+
+active_nfc = None
+active_instrument = None
+base_volume = 0.5
+current_volume = 0.5
+is_playing = False
+reference_angle = None
+beat_brightness = 0
+
+MATRIX_LAYOUT = 1
+
+
+def get_physical_index(offset, i):
+    x = i % 8
+    y = i // 8
+    if MATRIX_LAYOUT == 0:
+        physical_x = x
+    elif MATRIX_LAYOUT == 1:
+        physical_x = x if y % 2 == 0 else 7 - x
+    elif MATRIX_LAYOUT == 2:
+        physical_x = 7 - x if y % 2 == 0 else x
+    return offset + (y * 8) + physical_x
+
+
+async def led_render_loop():
+    global beat_brightness
+    while True:
+        base_colors = [(0, 0, 0)] * NUM_PIXELS
+        for uid, info in app_assigned_mapping.items():
+            if not info["is_bound"]:
+                continue
+            inst = info["instrument"]
+            b_idx = info["block_index"]
+            pattern = PATTERNS[inst]
+
+            color = (0, 255, 0) if uid == active_nfc else (255, 255, 255)
+            offset = b_idx * 64
+
+            for i in range(64):
+                if pattern[i] == 1:
+                    physical_index = get_physical_index(offset, i)
+                    base_colors[physical_index] = color
+
+        for i in range(NUM_PIXELS):
+            r, g, b = base_colors[i]
+            if beat_brightness > 0:
+                r = min(255, r + beat_brightness)
+                g = min(255, g + int(beat_brightness * 0.8))
+                b = min(255, b + int(beat_brightness * 0.2))
+            pixels[i] = (r, g, b)
+
+        pixels.show()
+
+        if beat_brightness > 0:
+            beat_brightness -= 20
+            if beat_brightness < 0:
+                beat_brightness = 0
+
+        await asyncio.sleep(0.03)
+
+
+def check_all_bound():
+    global is_playing
+    if all(info["is_bound"] for info in app_assigned_mapping.values()):
+        if not is_playing:
+            is_playing = True
+            for track in tracks.values():
+                track["channel"].unpause()
+            print("All building blocks are bound! Music will start playing automatically!")
+
+
+async def handle_client(websocket):
+    global active_nfc, active_instrument, base_volume, current_volume, is_playing
+    global reference_angle, beat_brightness
+    print("Client connected!")
+
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+
+            action = data.get("action")
+
+            if action == "nfc_tap":
+                uid = data.get("uid")
+                if uid in app_assigned_mapping:
+                    if not app_assigned_mapping[uid]["is_bound"]:
+                        app_assigned_mapping[uid]["is_bound"] = True
+                        inst = app_assigned_mapping[uid]["instrument"]
+                        print(f"[Binding successful] NFC: {uid} Successfully bound instrument: {inst}")
+                        check_all_bound()
+                    else:
+                        active_nfc = uid
+                        active_instrument = app_assigned_mapping[uid]["instrument"]
+                        print(f"[Select a block] NFC: {uid} -> Ready to control the instrument.: {active_instrument}")
+                else:
+                    print(f"Unknown NFC: {uid}")
+
+            elif action == "control_start":
+                if active_instrument:
+                    base_volume = tracks[active_instrument]["channel"].get_volume()
+                    reference_angle = None
+                    print(f"[Start Control] Locked {active_instrument} Base volume: {base_volume:.2f}，Waiting to record the starting position...")
+
+            elif action == "volume_change":
+                if active_instrument:
+                    current_angle = float(data.get("angle", 0))
+                    if reference_angle is None:
+                        reference_angle = current_angle
+                        print(f"[Record Base] Current position recorded as point 0 (Angle: {reference_angle:.2f})")
+
+                    diff = current_angle - reference_angle
+                    SENSITIVITY = 15.0
+                    volume_change = diff / SENSITIVITY
+
+                    new_volume = base_volume + volume_change
+                    current_volume = max(0.0, min(1.0, new_volume))
+                    tracks[active_instrument]["channel"].set_volume(current_volume)
+
+            elif action == "clear_selection":
+                if active_nfc:
+                    print("[Deselect] The current control target has been cleared.")
+                    active_nfc = None
+                    active_instrument = None
+
+            elif action == "beat_trigger":
+                beat_brightness = 255
+                print("✨ [Beat] Trigger light effect!")
+
+    except websockets.exceptions.ConnectionClosed:
+        print("Client disconnected.")
+
+
+async def main():
+    asyncio.create_task(led_render_loop())
+
+    async with websockets.serve(handle_client, "0.0.0.0", 8765):
+        print("Server started (port 8765)... Waiting for connection.")
+        await asyncio.Future()
+
+
+def cleanup():
+    print("\n Shutting down the system, turning off all LEDs...")
+    try:
+        pixels.fill((0, 0, 0))
+        pixels.show()
+    except Exception as e:
+        print(f"Error turning off LED: {e}")
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n Exit signal received. (Ctrl+C)")
+    finally:
+        cleanup()
+        sys.exit(0)
