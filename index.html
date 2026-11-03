@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BandLet Code</title>
+    <style>
+        /* 这里是控制网页长什么样的 CSS 样式 */
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f4f9;
+            color: #333;
+            text-align: center;
+            margin: 0;
+            padding: 40px 20px;
+        }
+        h1 {
+            font-size: 2.5rem;
+            color: #2c3e50;
+            margin-bottom: 30px;
+        }
+        .button-group {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin-bottom: 30px;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 1rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.3s, transform 0.1s;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        button:active {
+            transform: scale(0.98);
+        }
+        /* 代码显示区域的样式 */
+        .code-container {
+            display: none; /* 默认隐藏代码区域 */
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            text-align: left;
+            padding: 20px;
+            border-radius: 8px;
+            width: 90%;
+            max-width: 800px;
+            margin: 0 auto;
+            box-shadow: 0 10px 15px rgba(0,0,0,0.2);
+            overflow-x: auto; /* 代码太长时允许横向滚动 */
+        }
+        pre {
+            margin: 0;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 网页大标题 -->
+    <h1>BandLet Code</h1>
+
+    <!-- 两个按钮 -->
+    <div class="button-group">
+        <button onclick="showCode('arduino')">Baton Control Code</button>
+        <button onclick="showCode('pi')">Audio&Computing Hub+Instrument blocks Control Code</button>
+    </div>
+
+    <!-- Arduino 代码展示区 -->
+    <div id="arduino-code" class="code-container">
+<pre><code>
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <MPU6050_light.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <OneButton.h>
+
+// ================= Hardware pin definitions =================
+#define RST_PIN 27
+#define SS_PIN 5
+#define BUTTON_PIN 25
+
+// ================= Global object =================
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+MPU6050 mpu(Wire); 
+OneButton button(BUTTON_PIN, true); 
+WebSocketsClient webSocket;
+
+// ================= Network configuration =================
+const char* ssid = "iPhone";                 
+const char* password = "Rhino033!";          
+const char* server_ip = "172.20.10.4";       
+const int server_port = 8765;                
+
+// ================= State variables =================
+bool isControllingVolume = false;
+
+//  Beat detection related variables
+unsigned long lastBeatTime = 0;
+const int beatCooldown = 300;     // Trigger cooldown time (milliseconds) to avoid multiple triggers from a single swing.
+const float gyroThreshold = 250.0; // Swing angular velocity threshold
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+
+  webSocket.begin(server_ip, server_port, "/");
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+
+  SPI.begin(18, 19, 23, 5); 
+  mfrc522.PCD_Init();
+
+  Wire.begin(21, 22);
+  byte status = mpu.begin();
+  Serial.print(F("MPU6050 status: "));
+  Serial.println(status);
+  while(status!=0){ } 
+  
+  Serial.println(F("Calibrating MPU6050，Please place the baton still on the table and do not move it..."));
+  delay(1000);
+  mpu.calcOffsets(); 
+  Serial.println(F("Calibration complete!"));
+
+  button.attachLongPressStart(onButtonPress);   
+  button.attachLongPressStop(onButtonRelease);  
+  button.attachDoubleClick(onButtonDoubleClick);
+}
+
+void loop() {
+  webSocket.loop();
+  button.tick(); 
+  mpu.update();  
+
+  checkNFC();
+
+  if (isControllingVolume) {
+    // Mode A: Adjust volume while holding the button.
+    handleMotionControl();
+  } else {
+    // Mode B: When the button is not pressed, detect rapid swings to keep the beat.
+    handleBeatDetection();
+  }
+}
+
+// ================= Function =================
+
+void checkNFC() {
+  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
+    return;
+  }
+  String uidString = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    uidString += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+    uidString += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  uidString.toUpperCase();
+  
+  sendJsonMessage("nfc_tap", "uid", uidString);
+  mfrc522.PICC_HaltA(); 
+}
+
+void onButtonPress() {
+  isControllingVolume = true;
+  sendJsonMessage("control_start", "status", "pressed");
+}
+
+void onButtonRelease() {
+  isControllingVolume = false;
+  sendJsonMessage("control_stop", "status", "released");
+}
+
+void onButtonDoubleClick() {
+  sendJsonMessage("clear_selection", "status", "double_clicked");
+}
+
+void handleMotionControl() {
+  float currentAngle = mpu.getAngleY(); 
+  
+  static unsigned long lastSendTime = 0;
+  if (millis() - lastSendTime > 50) {
+    sendJsonMessage("volume_change", "angle", String(currentAngle));
+    lastSendTime = millis();
+  }
+}
+
+// Handle beat detection
+void handleBeatDetection() {
+  // Get the angular velocity of the Z-axis
+  float gyroZ = abs(mpu.getGyroZ());
+  
+  if (gyroZ > gyroThreshold && (millis() - lastBeatTime > beatCooldown)) {
+    lastBeatTime = millis();
+    sendJsonMessage("beat_trigger", "status", "triggered");
+    Serial.println("Beat Triggered! GyroZ: " + String(gyroZ));
+  }
+}
+
+void sendJsonMessage(String action, String key, String value) {
+  StaticJsonDocument<200> doc;
+  doc["action"] = action;
+  doc[key] = value;
+  
+  String output;
+  serializeJson(doc, output);
+  webSocket.sendTXT(output);
+}
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("WebSocket Disconnected");
+      break;
+    case WStype_CONNECTED:
+      Serial.println("WebSocket Connected");
+      break;
+  }
+}
+</code></pre>
+    </div>
+
+    <!-- 树莓派 代码展示区 -->
+    <div id="pi-code" class="code-container">
+<pre><code>
+import asyncio
+import websockets
+import json
+import pygame
+import os
+import sys
+import board
+import neopixel
+
+required_files = ["Guitar.wav", "Vocal.wav", "Drums.wav"]
+missing_files = [f for f in required_files if not os.path.exists(f)]
+
+if missing_files:
+    print(f"can't find the file: {', '.join(missing_files)}")
+    sys.exit(1)
+
+pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
+pygame.mixer.set_num_channels(8)
+
+tracks = {
+    "guitar": {"sound": pygame.mixer.Sound("Guitar.wav"), "channel": pygame.mixer.Channel(0)},
+    "vocal": {"sound": pygame.mixer.Sound("Vocal.wav"), "channel": pygame.mixer.Channel(1)},
+    "drum": {"sound": pygame.mixer.Sound("Drums.wav"), "channel": pygame.mixer.Channel(2)}
+}
+
+for name, track in tracks.items():
+    track["channel"].play(track["sound"], loops=-1)
+    track["channel"].set_volume(0.5)
+    track["channel"].pause()
+print("all music stems are loaded")
+
+NUM_PIXELS = 192
+pixels = neopixel.NeoPixel(board.D10, NUM_PIXELS, brightness=0.1, auto_write=False, pixel_order=neopixel.GRB)
+
+PATTERNS = {
+    "guitar": [
+        0, 0, 0, 0, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 0, 1, 0,
+        0, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 0, 0, 1, 0, 0, 0,
+        0, 1, 1, 1, 0, 0, 0, 0,
+        1, 1, 1, 1, 0, 0, 0, 0,
+        1, 1, 1, 0, 0, 0, 0, 0,
+        0, 1, 0, 0, 0, 0, 0, 0
+    ],
+    "vocal": [
+        0, 0, 0, 1, 1, 0, 0, 0,
+        0, 0, 1, 1, 1, 1, 0, 0,
+        0, 0, 1, 1, 1, 1, 0, 0,
+        0, 0, 0, 1, 1, 0, 0, 0,
+        0, 0, 0, 1, 1, 0, 0, 0,
+        0, 0, 1, 1, 1, 1, 0, 0,
+        0, 0, 0, 1, 1, 0, 0, 0,
+        0, 0, 0, 1, 1, 0, 0, 0
+    ],
+    "drum": [
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 1, 1, 0, 0, 1, 1, 0,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 1, 1, 0, 0, 1, 1, 0,
+        0, 1, 1, 0, 0, 1, 1, 0,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 0, 0, 0, 0, 0, 0, 0
+    ]
+}
+
+app_assigned_mapping = {
+    "1DDD24981C1080": {"instrument": "guitar", "block_index": 0, "is_bound": False},
+    "1DDB24981C1080": {"instrument": "vocal", "block_index": 1, "is_bound": False},
+    "1DDC24981C1080": {"instrument": "drum", "block_index": 2, "is_bound": False}
+}
+
+active_nfc = None
+active_instrument = None
+base_volume = 0.5
+current_volume = 0.5
+is_playing = False
+reference_angle = None
+beat_brightness = 0
+
+MATRIX_LAYOUT = 1
+
+
+def get_physical_index(offset, i):
+    x = i % 8
+    y = i // 8
+    if MATRIX_LAYOUT == 0:
+        physical_x = x
+    elif MATRIX_LAYOUT == 1:
+        physical_x = x if y % 2 == 0 else 7 - x
+    elif MATRIX_LAYOUT == 2:
+        physical_x = 7 - x if y % 2 == 0 else x
+    return offset + (y * 8) + physical_x
+
+
+async def led_render_loop():
+    global beat_brightness
+    while True:
+        base_colors = [(0, 0, 0)] * NUM_PIXELS
+        for uid, info in app_assigned_mapping.items():
+            if not info["is_bound"]:
+                continue
+            inst = info["instrument"]
+            b_idx = info["block_index"]
+            pattern = PATTERNS[inst]
+
+            color = (0, 255, 0) if uid == active_nfc else (255, 255, 255)
+            offset = b_idx * 64
+
+            for i in range(64):
+                if pattern[i] == 1:
+                    physical_index = get_physical_index(offset, i)
+                    base_colors[physical_index] = color
+
+        for i in range(NUM_PIXELS):
+            r, g, b = base_colors[i]
+            if beat_brightness > 0:
+                r = min(255, r + beat_brightness)
+                g = min(255, g + int(beat_brightness * 0.8))
+                b = min(255, b + int(beat_brightness * 0.2))
+            pixels[i] = (r, g, b)
+
+        pixels.show()
+
+        if beat_brightness > 0:
+            beat_brightness -= 20
+            if beat_brightness < 0:
+                beat_brightness = 0
+
+        await asyncio.sleep(0.03)
+
+
+def check_all_bound():
+    global is_playing
+    if all(info["is_bound"] for info in app_assigned_mapping.values()):
+        if not is_playing:
+            is_playing = True
+            for track in tracks.values():
+                track["channel"].unpause()
+            print("All building blocks are bound! Music will start playing automatically!")
+
+
+async def handle_client(websocket):
+    global active_nfc, active_instrument, base_volume, current_volume, is_playing
+    global reference_angle, beat_brightness
+    print("Client connected!")
+
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+
+            action = data.get("action")
+
+            if action == "nfc_tap":
+                uid = data.get("uid")
+                if uid in app_assigned_mapping:
+                    if not app_assigned_mapping[uid]["is_bound"]:
+                        app_assigned_mapping[uid]["is_bound"] = True
+                        inst = app_assigned_mapping[uid]["instrument"]
+                        print(f"[Binding successful] NFC: {uid} Successfully bound instrument: {inst}")
+                        check_all_bound()
+                    else:
+                        active_nfc = uid
+                        active_instrument = app_assigned_mapping[uid]["instrument"]
+                        print(f"[Select a block] NFC: {uid} -> Ready to control the instrument.: {active_instrument}")
+                else:
+                    print(f"Unknown NFC: {uid}")
+
+            elif action == "control_start":
+                if active_instrument:
+                    base_volume = tracks[active_instrument]["channel"].get_volume()
+                    reference_angle = None
+                    print(f"[Start Control] Locked {active_instrument} Base volume: {base_volume:.2f}，Waiting to record the starting position...")
+
+            elif action == "volume_change":
+                if active_instrument:
+                    current_angle = float(data.get("angle", 0))
+                    if reference_angle is None:
+                        reference_angle = current_angle
+                        print(f"[Record Base] Current position recorded as point 0 (Angle: {reference_angle:.2f})")
+
+                    diff = current_angle - reference_angle
+                    SENSITIVITY = 15.0
+                    volume_change = diff / SENSITIVITY
+
+                    new_volume = base_volume + volume_change
+                    current_volume = max(0.0, min(1.0, new_volume))
+                    tracks[active_instrument]["channel"].set_volume(current_volume)
+
+            elif action == "clear_selection":
+                if active_nfc:
+                    print("[Deselect] The current control target has been cleared.")
+                    active_nfc = None
+                    active_instrument = None
+
+            elif action == "beat_trigger":
+                beat_brightness = 255
+                print("✨ [Beat] Trigger light effect!")
+
+    except websockets.exceptions.ConnectionClosed:
+        print("Client disconnected.")
+
+
+async def main():
+    asyncio.create_task(led_render_loop())
+
+    async with websockets.serve(handle_client, "0.0.0.0", 8765):
+        print("Server started (port 8765)... Waiting for connection.")
+        await asyncio.Future()
+
+
+def cleanup():
+    print("\n Shutting down the system, turning off all LEDs...")
+    try:
+        pixels.fill((0, 0, 0))
+        pixels.show()
+    except Exception as e:
+        print(f"Error turning off LED: {e}")
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n Exit signal received. (Ctrl+C)")
+    finally:
+        cleanup()
+        sys.exit(0)
+</code></pre>
+    </div>
+
+    <!-- 控制点击按钮显示/隐藏代码的 JavaScript -->
+    <script>
+        function showCode(type) {
+            // 先把两个代码框都隐藏起来
+            document.getElementById('arduino-code').style.display = 'none';
+            document.getElementById('pi-code').style.display = 'none';
+
+            // 根据点击的按钮，显示对应的代码框
+            if (type === 'arduino') {
+                document.getElementById('arduino-code').style.display = 'block';
+            } else if (type === 'pi') {
+                document.getElementById('pi-code').style.display = 'block';
+            }
+        }
+    </script>
+
+</body>
+</html>
